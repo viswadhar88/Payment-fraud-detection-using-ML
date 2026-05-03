@@ -1,11 +1,15 @@
 # fraud_detection.py — Polished & Efficient Version (Same Layout, Enhanced UI)
+import shap
 import streamlit as st
 import pandas as pd
 import joblib
 import plotly.express as px
+import plotly.figure_factory as ff
+import numpy as np
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
 
 # =====================================
 # PAGE CONFIGURATION & GLOBAL STYLING
@@ -114,7 +118,8 @@ def centered_title(title, icon=None):
 @st.cache_resource
 def load_model():
     try:
-       return joblib.load("models/fraud_detection_pipeline.pkl")
+       import os
+       return joblib.load(os.path.join(os.path.dirname(__file__), "../models/fraud_detection_pipeline.pkl"))
     except Exception as e:
         st.error(f"Error loading model: {e}")
         return None
@@ -154,37 +159,51 @@ def send_email_alert(transaction_info):
         st.warning(f"Email alert failed: {e}")
 
 # ---------- Prediction Logic ----------
-def explain_prediction(t_type, amount, old_org, new_org, old_dest, new_dest):
-    reasons = []
-    if amount > 100000:
-        reasons.append("Unusually high transaction amount.")
-    if new_org > old_org:
-        reasons.append("Sender balance increased unexpectedly.")
-    if old_dest == 0 and new_dest > 0:
-        reasons.append("Receiver account was empty before transaction.")
-    if old_org - new_org != amount:
-        reasons.append("Mismatch between amount and sender balance difference.")
-    if not reasons:
-        reasons.append("Transaction within expected range.")
-    return " | ".join(reasons)
+def explain_prediction(model, df_input):
+    try:
+        explainer = shap.TreeExplainer(model.named_steps['classifier'])
+        preprocessed = model.named_steps['preprocessor'].transform(df_input)
+        shap_values = explainer.shap_values(preprocessed)
+        
+        feature_names = ["type","amount","oldbalanceOrg","newbalanceOrig","oldbalanceDest","newbalanceDest"]
+        
+        # For fraud class (index 1)
+        if isinstance(shap_values, list):
+            vals = shap_values[1][0]
+        else:
+            vals = shap_values[0]
+        
+        top_features = sorted(zip(feature_names, vals), key=lambda x: abs(x[1]), reverse=True)[:3]
+        reasons = [f"{f} (impact: {v:+.3f})" for f, v in top_features]
+        return " | ".join(reasons)
+    except:
+        return "Explanation unavailable"
 
 def predict_transaction(model, t_type, amount, old_org, new_org, old_dest, new_dest):
+    balance_diff = old_org - new_org
+    error_balance = abs(amount - balance_diff)
+    is_empty_dest = 1 if old_dest == 0 else 0
+
     df = pd.DataFrame([{
         "type": t_type, "amount": amount,
         "oldbalanceOrg": old_org, "newbalanceOrig": new_org,
-        "oldbalanceDest": old_dest, "newbalanceDest": new_dest
+        "oldbalanceDest": old_dest, "newbalanceDest": new_dest,
+        "balance_diff": balance_diff,
+        "error_balance": error_balance,
+        "is_empty_dest": is_empty_dest
     }])
     proba = model.predict_proba(df)[0][1]
-    pred = "Fraud" if proba > 0.5 else "Not Fraud"
+    threshold = st.session_state.get("threshold", 0.5)
+    pred = "Fraud" if proba > threshold else "Not Fraud"
     risk_score = int(round(proba * 100))
-    reason = explain_prediction(t_type, amount, old_org, new_org, old_dest, new_dest)
+    reason = explain_prediction(model, df)
     return pred, risk_score, reason
 
 # =====================================
 # NAVIGATION BAR
 # =====================================
-nav_labels = ["🏠 Home","🔍 Single Prediction","🏦 Bank Transactions","📊 Dashboard","👥 About Us"]
-nav_pages = ["Home","Single Prediction","Bank Transactions","Dashboard","About Us"]
+nav_labels = ["🏠 Home","🔍 Single Prediction","🏦 Bank Transactions","📊 Dashboard","📈 Model Performance","👥 About Us"]
+nav_pages = ["Home","Single Prediction","Bank Transactions","Dashboard","Model Performance","About Us"]
 with st.container():
     cols = st.columns(len(nav_labels))
     for col, label, page in zip(cols, nav_labels, nav_pages):
@@ -218,6 +237,8 @@ if st.session_state.page == "Home":
 # =====================================
 elif st.session_state.page == "Single Prediction":
     centered_title("Single Transaction Prediction", "🔍")
+    st.session_state["threshold"] = st.slider("🎚️ Detection Threshold", 0.1, 0.9, 0.5, 0.05,
+    help="Lower = catch more frauds but more false alarms. Higher = fewer alerts but may miss frauds.")
     model = load_model()
     if model:
         with st.form("single_pred_form"):
@@ -335,7 +356,73 @@ elif st.session_state.page == "Dashboard":
         st.dataframe(combined)
     else:
         st.info("No transactions to display yet. Upload or predict to view insights.")
+# =====================================
+# PAGE: MODEL PERFORMANCE
+# =====================================
+elif st.session_state.page == "Model Performance":
+    centered_title("Model Performance", "📈")
 
+    combined = pd.concat(
+        [st.session_state.single_predictions, st.session_state.file_predictions],
+        ignore_index=True
+    )
+
+    if combined.empty or "Result" not in combined.columns:
+        st.info("⚠️ No predictions yet. Go to Single Prediction or Bank Transactions first, then come back here.")
+    else:
+        # --- Confusion Matrix ---
+        st.subheader("🟦 Confusion Matrix")
+        y_true = combined["Result"].apply(lambda x: 1 if x == "Fraud" else 0)
+        y_pred = combined["Risk Score"].apply(lambda x: 1 if x >= 50 else 0)
+
+        cm = confusion_matrix(y_true, y_pred)
+        labels = ["Not Fraud", "Fraud"]
+
+        fig_cm = ff.create_annotated_heatmap(
+            z=cm,
+            x=labels,
+            y=labels,
+            colorscale="Blues",
+            showscale=True
+        )
+        fig_cm.update_layout(
+            title="Confusion Matrix",
+            xaxis_title="Predicted",
+            yaxis_title="Actual"
+        )
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+        # --- ROC Curve ---
+        st.subheader("📉 ROC-AUC Curve")
+        y_score = combined["Risk Score"] / 100
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc = auc(fpr, tpr)
+
+        fig_roc = px.area(
+            x=fpr, y=tpr,
+            title=f"ROC Curve (AUC = {roc_auc:.2f})",
+            labels={"x": "False Positive Rate", "y": "True Positive Rate"},
+            color_discrete_sequence=["#1e3c72"]
+        )
+        fig_roc.add_shape(
+            type="line", line=dict(dash="dash", color="red"),
+            x0=0, x1=1, y0=0, y1=1
+        )
+        st.plotly_chart(fig_roc, use_container_width=True)
+
+        # --- Classification Report ---
+        st.subheader("📊 Classification Report")
+        report = classification_report(y_true, y_pred, target_names=["Not Fraud", "Fraud"], output_dict=True)
+        report_df = pd.DataFrame(report).transpose().round(2)
+        st.dataframe(report_df)
+
+        # --- Key Metrics ---
+        st.subheader("🎯 Key Metrics")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("AUC Score", f"{roc_auc:.2f}")
+        col2.metric("Precision (Fraud)", f"{report['Fraud']['precision']:.2f}")
+        col3.metric("Recall (Fraud)", f"{report['Fraud']['recall']:.2f}")
+        col4.metric("F1 Score (Fraud)", f"{report['Fraud']['f1-score']:.2f}")
 # =====================================
 # PAGE: ABOUT US
 # =====================================
